@@ -1,9 +1,11 @@
-CC = gcc
-CFLAGS = -std=gnu11 -Wall -Wextra -O2 -g -pedantic
+CC     = gcc
+FLAGS = -g -std=c99 -Wall -Wvla -Werror -fsanitize=address,undefined
+
+all: mysh
 
 mysh: mysh.c
-	$(CC) $(CFLAGS) -o mysh mysh.c
+		$(CC) $(FLAGS) -o $@ $^
 
 clean:
-	rm -f mysh
+	rm -f *.o mysh
 
