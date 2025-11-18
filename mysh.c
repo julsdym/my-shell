@@ -1,631 +1,401 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
+#include <signal.h>
 #include <fcntl.h>
-#include <ctype.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <glob.h>
 
-#define MAX_TOKENS 256
-#define MAX_PIPES 64
-#define BUFFER_SIZE 1024
 
-typedef enum {
-    TOKEN_WORD,
-    TOKEN_PIPE,
-    TOKEN_INPUT_REDIR,
-    TOKEN_OUTPUT_REDIR,
-    TOKEN_AND,
-    TOKEN_OR
-} TokenType;
+#define true 1
+#define false 0
+#define MAX_COMMANDS 16
 
-typedef struct {
-    char *value;
-    TokenType type;
-} Token;
 
-typedef struct {
+#define STATUS_EXIT 200
+#define STATUS_DIE 201
+typedef struct Command {
+    char *path;
     char **args;
-    int arg_count;
-    char *input_file;
-    char *output_file;
+    int arg_length;
+    int fd_in;
+    int fd_out;
 } Command;
 
-int last_exit_status = 0;
-int interactive_mode = 0;
-int should_exit = 0;
 
-// Function prototypes
-void read_command(int fd, char *buffer, int *len);
-int tokenize(char *line, Token **tokens);
-int parse_command(Token *tokens, int token_count, Command **commands, int *is_pipeline, int *is_conditional, char *cond_type);
-int execute_command(Command *commands, int cmd_count, int is_pipeline);
-int execute_builtin_in_child(Command *cmd);
-int is_builtin(const char *name);
-char *find_program(const char *name);
-void free_tokens(Token *tokens, int count);
-void free_commands(Command *commands, int count);
-
-int main(int argc, char *argv[]) {
-    int input_fd = STDIN_FILENO;
-    if (argc > 2) {
-        fprintf(stderr, "Usage: %s [script_file]\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-    
-    if (argc == 2) {
-        input_fd = open(argv[1], O_RDONLY);
-        if (input_fd < 0) {
-            perror(argv[1]);
-            return EXIT_FAILURE;
-        }
-    }
-    
-    interactive_mode = isatty(input_fd);
-    
-    if (interactive_mode) {
-        printf("Welcome to my shell!\n");
-    }
-    
-    char buffer[BUFFER_SIZE];
-    int buf_len = 0;
-    
-    while (1) {
-        if (interactive_mode) {
-            printf("mysh> ");
-            fflush(stdout);
-        }
-        
-        read_command(input_fd, buffer, &buf_len);
-        
-        if (buf_len == 0) {
-            break;
-        }
-        
-        buffer[buf_len] = '\0';
-    
-        Token *tokens;
-        int token_count = tokenize(buffer, &tokens);
-        
-        if (token_count == 0) {
-            buf_len = 0;
-            continue; 
-        }
-        
-        Command *commands;
-        int cmd_count;
-        int is_pipeline = 0;
-        int is_conditional = 0;
-        char cond_type[4] = "";
-        
-        int parse_result = parse_command(tokens, token_count, &commands, &is_pipeline, &is_conditional, cond_type);
-        
-        if (parse_result < 0) {
-            last_exit_status = 1;
-            free_tokens(tokens, token_count);
-            buf_len = 0;
-            continue;
-        }
-        
-        cmd_count = parse_result;
-        
-        // Handle conditionals
-        if (is_conditional) {
-            if (strcmp(cond_type, "and") == 0 && last_exit_status != 0) {
-                free_tokens(tokens, token_count);
-                free_commands(commands, cmd_count);
-                buf_len = 0;
-                continue;
-            }
-            if (strcmp(cond_type, "or") == 0 && last_exit_status == 0) {
-                free_tokens(tokens, token_count);
-                free_commands(commands, cmd_count);
-                buf_len = 0;
-                continue;
-            }
-        }
-        
-        // Check for cd - must be handled specially (not in child process)
-        if (cmd_count == 1 && !is_pipeline && commands[0].arg_count > 0 && 
-            strcmp(commands[0].args[0], "cd") == 0) {
-            if (commands[0].arg_count != 2) {
-                fprintf(stderr, "cd: wrong number of arguments\n");
-                last_exit_status = 1;
-            } else {
-                if (chdir(commands[0].args[1]) < 0) {
-                    perror("cd");
-                    last_exit_status = 1;
-                } else {
-                    last_exit_status = 0;
-                }
-            }
-            free_tokens(tokens, token_count);
-            free_commands(commands, cmd_count);
-            buf_len = 0;
-            continue;
-        }
-        
-        int result = execute_command(commands, cmd_count, is_pipeline);
-        last_exit_status = (result == 0) ? 0 : 1;
-        
-        free_tokens(tokens, token_count);
-        free_commands(commands, cmd_count);
-        buf_len = 0;
-        
-        if (should_exit) {
-            break;
-        }
-    }
-    
-    if (interactive_mode) {
-        printf("mysh: exiting\n");
-    }
-    
-    if (input_fd != STDIN_FILENO) {
-        close(input_fd);
-    }
-    
-    return EXIT_SUCCESS;
+volatile int active = 1;
+void handle() {
+    active = 0;
 }
-
-void read_command(int fd, char *buffer, int *len) {
-    *len = 0;
-    char c;
-    ssize_t n;
-    
-    while ((n = read(fd, &c, 1)) > 0) {
-        buffer[*len] = c;
-        (*len)++;
-        
-        if (c == '\n') {
-            break;
-        }
-        
-        if (*len >= BUFFER_SIZE - 1) {
-            break;
-        }
-    }
+void install_handlers() {
+    struct sigaction act;
+    act.sa_handler = handle;
+    act.sa_flags = 0;
+    sigemptyset(&act.sa_mask);
+    sigaction(SIGINT, &act, NULL);
 }
-
-int tokenize(char *line, Token **tokens) {
-    Token *token_array = malloc(sizeof(Token) * MAX_TOKENS);
-    int count = 0;
-    int i = 0;
-    int len = strlen(line);
-    
-    while (i < len) {
-        while (i < len && isspace(line[i])) i++;
-        
-        if (i >= len) break;
-        
-        if (line[i] == '#') {
-            break;
-        }
-        
-        if (line[i] == '|') {
-            token_array[count].value = strdup("|");
-            token_array[count].type = TOKEN_PIPE;
-            count++;
-            i++;
-            continue;
-        }
-        
-        if (line[i] == '<') {
-            token_array[count].value = strdup("<");
-            token_array[count].type = TOKEN_INPUT_REDIR;
-            count++;
-            i++;
-            continue;
-        }
-        
-        if (line[i] == '>') {
-            token_array[count].value = strdup(">");
-            token_array[count].type = TOKEN_OUTPUT_REDIR;
-            count++;
-            i++;
-            continue;
-        }
-        
-        int start = i;
-        while (i < len && !isspace(line[i]) && line[i] != '|' && line[i] != '<' && line[i] != '>' && line[i] != '#') {
-            i++;
-        }
-        
-        if (i > start) {
-            int word_len = i - start;
-            char *word = malloc(word_len + 1);
-            strncpy(word, line + start, word_len);
-            word[word_len] = '\0';
-            
-            if (strcmp(word, "and") == 0) {
-                token_array[count].value = word;
-                token_array[count].type = TOKEN_AND;
-            } else if (strcmp(word, "or") == 0) {
-                token_array[count].value = word;
-                token_array[count].type = TOKEN_OR;
-            } else {
-                token_array[count].value = word;
-                token_array[count].type = TOKEN_WORD;
-            }
-            count++;
-        }
-    }
-    
-    *tokens = token_array;
-    return count;
+Command *newCommand() {
+    Command *cmd = malloc(sizeof(Command));
+    cmd->path = calloc(1, BUFSIZ);
+    cmd->args = NULL;
+    cmd->arg_length = 0;
+    cmd->fd_in = STDIN_FILENO;
+    cmd->fd_out = STDOUT_FILENO;
+    return cmd;
 }
-
-int parse_command(Token *tokens, int token_count, Command **commands, int *is_pipeline, int *is_conditional, char *cond_type) {
-    Command *cmd_array = malloc(sizeof(Command) * MAX_PIPES);
-    int cmd_idx = 0;
-    int i = 0;
-    
-    cmd_array[cmd_idx].args = malloc(sizeof(char*) * MAX_TOKENS);
-    cmd_array[cmd_idx].arg_count = 0;
-    cmd_array[cmd_idx].input_file = NULL;
-    cmd_array[cmd_idx].output_file = NULL;
-    
-    *is_conditional = 0;
-    *is_pipeline = 0;
-    
-    // Check for conditional at the start
-    if (token_count > 0 && (tokens[0].type == TOKEN_AND || tokens[0].type == TOKEN_OR)) {
-        *is_conditional = 1;
-        strcpy(cond_type, tokens[0].value);
-        i = 1;
+void freeCommand(Command *cmd) {
+    if (cmd->args != NULL) {
+        for (int i = 0; i < cmd->arg_length; i++)
+            free(cmd->args[i]);
+        free(cmd->args);
     }
-    
-    // Check for pipes to determine if this is a pipeline
-    for (int j = i; j < token_count; j++) {
-        if (tokens[j].type == TOKEN_PIPE) {
-            *is_pipeline = 1;
-            break;
-        }
-    }
-    
-    // Validate: no conditionals after pipes
-    for (int j = i; j < token_count; j++) {
-        if (tokens[j].type == TOKEN_PIPE) {
-            for (int k = j + 1; k < token_count; k++) {
-                if (tokens[k].type == TOKEN_AND || tokens[k].type == TOKEN_OR) {
-                    fprintf(stderr, "Syntax error: conditional after pipe\n");
-                    for (int m = 0; m <= cmd_idx; m++) {
-                        free(cmd_array[m].args);
-                        if (cmd_array[m].input_file) free(cmd_array[m].input_file);
-                        if (cmd_array[m].output_file) free(cmd_array[m].output_file);
-                    }
-                    free(cmd_array);
-                    return -1;
-                }
-            }
-        }
-    }
-    
-    // Validate: no redirection in pipelines (except first and last commands)
-    if (*is_pipeline) {
-        int in_middle = 0;
-        for (int j = i; j < token_count; j++) {
-            if (tokens[j].type == TOKEN_PIPE) {
-                in_middle = 1;
-            } else if (in_middle && (tokens[j].type == TOKEN_INPUT_REDIR || tokens[j].type == TOKEN_OUTPUT_REDIR)) {
-                // Check if we're still in the middle or at the last command
-                int more_pipes = 0;
-                for (int k = j + 1; k < token_count; k++) {
-                    if (tokens[k].type == TOKEN_PIPE) {
-                        more_pipes = 1;
-                        break;
-                    }
-                }
-                if (more_pipes) {
-                    fprintf(stderr, "Syntax error: redirection in middle of pipeline\n");
-                    for (int m = 0; m <= cmd_idx; m++) {
-                        free(cmd_array[m].args);
-                        if (cmd_array[m].input_file) free(cmd_array[m].input_file);
-                        if (cmd_array[m].output_file) free(cmd_array[m].output_file);
-                    }
-                    free(cmd_array);
-                    return -1;
-                }
-            }
-        }
-    }
-    
-    while (i < token_count) {
-        Token *t = &tokens[i];
-        
-        if (t->type == TOKEN_PIPE) {
-            cmd_idx++;
-            cmd_array[cmd_idx].args = malloc(sizeof(char*) * MAX_TOKENS);
-            cmd_array[cmd_idx].arg_count = 0;
-            cmd_array[cmd_idx].input_file = NULL;
-            cmd_array[cmd_idx].output_file = NULL;
-            i++;
-            continue;
-        }
-        
-        if (t->type == TOKEN_INPUT_REDIR) {
-            if (i + 1 >= token_count || tokens[i + 1].type != TOKEN_WORD) {
-                fprintf(stderr, "Syntax error: expected filename after <\n");
-                for (int j = 0; j <= cmd_idx; j++) {
-                    free(cmd_array[j].args);
-                    if (cmd_array[j].input_file) free(cmd_array[j].input_file);
-                    if (cmd_array[j].output_file) free(cmd_array[j].output_file);
-                }
-                free(cmd_array);
-                return -1;
-            }
-            cmd_array[cmd_idx].input_file = strdup(tokens[i + 1].value);
-            i += 2;
-            continue;
-        }
-        
-        if (t->type == TOKEN_OUTPUT_REDIR) {
-            if (i + 1 >= token_count || tokens[i + 1].type != TOKEN_WORD) {
-                fprintf(stderr, "Syntax error: expected filename after >\n");
-                for (int j = 0; j <= cmd_idx; j++) {
-                    free(cmd_array[j].args);
-                    if (cmd_array[j].input_file) free(cmd_array[j].input_file);
-                    if (cmd_array[j].output_file) free(cmd_array[j].output_file);
-                }
-                free(cmd_array);
-                return -1;
-            }
-            cmd_array[cmd_idx].output_file = strdup(tokens[i + 1].value);
-            i += 2;
-            continue;
-        }
-        
-        if (t->type == TOKEN_WORD) {
-            cmd_array[cmd_idx].args[cmd_array[cmd_idx].arg_count] = strdup(t->value);
-            cmd_array[cmd_idx].arg_count++;
-            i++;
-            continue;
-        }
-        
-        i++;
-    }
-    
-    for (int j = 0; j <= cmd_idx; j++) {
-        cmd_array[j].args[cmd_array[j].arg_count] = NULL;
-    }
-    
-    *commands = cmd_array;
-    return cmd_idx + 1;
+    free(cmd->path);
+    free(cmd);
 }
-
-int is_builtin(const char *name) {
-    return strcmp(name, "cd") == 0 || strcmp(name, "pwd") == 0 ||
-           strcmp(name, "which") == 0 || strcmp(name, "exit") == 0 ||
-           strcmp(name, "die") == 0;
+void freeCommandList(Command **cmds, int length) {
+    for (int i = 0; i < length; i++)
+        freeCommand(cmds[i]);
 }
+char **add_to_args(Command *cmd, char **args, int *len, char *token) {
+    if (cmd->path[0] == '\0') {
+        strcpy(cmd->path, token);
+        free(token);
+        return args;
+    }
+    (*len)++;
+    args = realloc(args, (*len) * sizeof(char*));
+    args[*len - 1] = token;
+    return args;
+}
+int try_execute(char *path, Command *cmd) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) {
 
-int execute_builtin_in_child(Command *cmd) {
-    if (strcmp(cmd->args[0], "pwd") == 0) {
-        char cwd[BUFFER_SIZE];
-        if (getcwd(cwd, sizeof(cwd)) != NULL) {
-            printf("%s\n", cwd);
-            exit(EXIT_SUCCESS);
-        } else {
-            perror("pwd");
-            exit(EXIT_FAILURE);
+
+            char **exec_args = malloc((cmd->arg_length + 2) * sizeof(char*));
+            exec_args[0] = cmd->path;
+            for (int i = 0; i < cmd->arg_length; i++)
+                exec_args[i + 1] = cmd->args[i];
+            exec_args[cmd->arg_length + 1] = NULL;
+
+
+            execv(path, exec_args);
+            perror("execv");
+            exit(1);
         }
+        perror("file not executable");
+        exit(1);
     }
-    
-    if (strcmp(cmd->args[0], "which") == 0) {
-        if (cmd->arg_count != 2) {
-            exit(EXIT_FAILURE);
-        }
-        if (is_builtin(cmd->args[1])) {
-            exit(EXIT_FAILURE);
-        }
-        
-        char *path = find_program(cmd->args[1]);
-        if (path) {
-            printf("%s\n", path);
-            free(path);
-            exit(EXIT_SUCCESS);
-        }
-        exit(EXIT_FAILURE);
-    }
-    
-    if (strcmp(cmd->args[0], "exit") == 0) {
-        exit(EXIT_SUCCESS);
-    }
-    
-    if (strcmp(cmd->args[0], "die") == 0) {
-        for (int i = 1; i < cmd->arg_count; i++) {
-            printf("%s", cmd->args[i]);
-            if (i < cmd->arg_count - 1) printf(" ");
-        }
-        if (cmd->arg_count > 1) printf("\n");
-        exit(EXIT_FAILURE);
-    }
-    
     return -1;
 }
+int non_built_in(Command *cmd) {
+    if (strchr(cmd->path, '/'))
+        return try_execute(cmd->path, cmd) == 0 ? 0 : 1;
 
-char *find_program(const char *name) {
-    if (strchr(name, '/')) {
-        if (access(name, X_OK) == 0) {
-            return strdup(name);
-        }
-        return NULL;
-    }
-    
-    const char *dirs[] = {"/usr/local/bin", "/usr/bin", "/bin"};
+
+    const char *dirs[] = {
+        "/usr/local/bin/",
+        "/usr/bin/",
+        "/bin/"
+    };
+
+
+    char path[PATH_MAX];
     for (int i = 0; i < 3; i++) {
-        char path[BUFFER_SIZE];
-        snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
-        if (access(path, X_OK) == 0) {
-            return strdup(path);
-        }
+        strcpy(path, dirs[i]);
+        strcat(path, cmd->path);
+        if (try_execute(path, cmd) == 0)
+            return 0;
     }
-    
-    return NULL;
+    perror("command not found");
+    exit(1);
 }
 
-int execute_command(Command *commands, int cmd_count, int is_pipeline) {
-    // Create pipes before forking
-    int pipes[MAX_PIPES][2];
-    for (int i = 0; i < cmd_count - 1; i++) {
-        if (pipe(pipes[i]) < 0) {
-            perror("pipe");
-            return -1;
+
+int execute_command(Command *cmd) {
+    if (cmd->path[0] == '\0')
+        return 0;
+
+
+    if (!strcmp(cmd->path, "pwd")) {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd))) {
+            write(cmd->fd_out, cwd, strlen(cwd));
+            write(cmd->fd_out, "\n", 1);
+            if (cmd->fd_out != STDOUT_FILENO) close(cmd->fd_out);
+            return 0;
         }
+        perror("pwd");
+        return 1;
     }
-    
-    pid_t pids[MAX_PIPES];
-    int should_redirect_stdin = !interactive_mode && !isatty(STDIN_FILENO);
-    
-    for (int i = 0; i < cmd_count; i++) {
-        Command *cmd = &commands[i];
-        
-        if (cmd->arg_count == 0) continue;
-        
-        // Check if command is found
-        char *prog_path = NULL;
-        if (!is_builtin(cmd->args[0])) {
-            prog_path = find_program(cmd->args[0]);
-            if (!prog_path) {
-                fprintf(stderr, "%s: command not found\n", cmd->args[0]);
-                // Close all pipes and wait for already started children
-                for (int j = 0; j < cmd_count - 1; j++) {
-                    close(pipes[j][0]);
-                    close(pipes[j][1]);
-                }
-                for (int j = 0; j < i; j++) {
-                    waitpid(pids[j], NULL, 0);
-                }
-                return -1;
-            }
+
+
+    if (!strcmp(cmd->path, "cd")) {
+        if (cmd->arg_length > 1) return 1;
+
+
+        if (cmd->arg_length == 0) {
+            char *h = getenv("HOME");
+            return (h && chdir(h) == 0) ? 0 : (perror("cd"), 1);
         }
-        
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            if (prog_path) free(prog_path);
-            // Close pipes and cleanup
-            for (int j = 0; j < cmd_count - 1; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-            for (int j = 0; j < i; j++) {
-                waitpid(pids[j], NULL, 0);
-            }
-            return -1;
-        }
-        
-        if (pid == 0) {
-            // Child process
-            
-            // Handle input redirection
-            if (cmd->input_file) {
-                int fd = open(cmd->input_file, O_RDONLY);
-                if (fd < 0) {
-                    perror(cmd->input_file);
-                    exit(EXIT_FAILURE);
-                }
-                dup2(fd, STDIN_FILENO);
-                close(fd);
-            } else if (i > 0) {
-                dup2(pipes[i-1][0], STDIN_FILENO);
-            } else if (should_redirect_stdin) {
-                int null_fd = open("/dev/null", O_RDONLY);
-                if (null_fd >= 0) {
-                    dup2(null_fd, STDIN_FILENO);
-                    close(null_fd);
-                }
-            }
-            
-            // Handle output redirection
-            if (cmd->output_file) {
-                int fd = open(cmd->output_file, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP);
-                if (fd < 0) {
-                    perror(cmd->output_file);
-                    exit(EXIT_FAILURE);
-                }
-                dup2(fd, STDOUT_FILENO);
-                close(fd);
-            } else if (i < cmd_count - 1) {
-                dup2(pipes[i][1], STDOUT_FILENO);
-            }
-            
-            // Close all pipe file descriptors in child
-            for (int j = 0; j < cmd_count - 1; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-            
-            // Execute the command
-            if (is_builtin(cmd->args[0])) {
-                execute_builtin_in_child(cmd);
-                // If we get here, it's a built-in that should set should_exit
-                if (strcmp(cmd->args[0], "exit") == 0) {
-                    exit(EXIT_SUCCESS);
-                } else if (strcmp(cmd->args[0], "die") == 0) {
-                    exit(EXIT_FAILURE);
-                }
-                exit(EXIT_FAILURE);
-            } else {
-                execv(prog_path, cmd->args);
-                perror(prog_path);
-                exit(EXIT_FAILURE);
-            }
-        }
-        
-        // Parent process
-        pids[i] = pid;
-        if (prog_path) free(prog_path);
+        return (chdir(cmd->args[0]) == 0) ? 0 : (perror("cd"), 1);
     }
-    
-    // Close all pipes in parent
-    for (int i = 0; i < cmd_count - 1; i++) {
-        close(pipes[i][0]);
-        close(pipes[i][1]);
-    }
-    
-    // Wait for all children and check for exit/die
-    int last_status = 0;
-    for (int i = 0; i < cmd_count; i++) {
-        int status;
-        waitpid(pids[i], &status, 0);
-        
-        // Check if this was exit or die command
-        if (commands[i].arg_count > 0) {
-            if (strcmp(commands[i].args[0], "exit") == 0) {
-                should_exit = 1;
-            } else if (strcmp(commands[i].args[0], "die") == 0) {
-                should_exit = 1;
+
+
+    if (!strcmp(cmd->path, "which")) {
+        if (cmd->arg_length != 1) return 1;
+
+
+        const char *t = cmd->args[0];
+        if (!strcmp(t, "cd") || !strcmp(t, "pwd") ||
+            !strcmp(t, "which") || !strcmp(t, "exit") ||
+            !strcmp(t, "die"))
+            return 1;
+
+
+        const char *dirs[] = {"/usr/local/bin/", "/usr/bin/", "/bin/"};
+        char p[PATH_MAX];
+        struct stat st;
+
+
+        for (int i = 0; i < 3; i++) {
+            strcpy(p, dirs[i]);
+            strcat(p, t);
+            if (stat(p, &st) == 0 && (st.st_mode & 0111)) {
+                write(cmd->fd_out, p, strlen(p));
+                write(cmd->fd_out, "\n", 1);
+                return 0;
             }
         }
-        
-        if (i == cmd_count - 1) {
-            last_status = WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
-        }
+        return 1;
     }
-    
-    return last_status;
+
+
+    if (!strcmp(cmd->path, "exit"))
+        return STATUS_EXIT;
+
+
+    if (!strcmp(cmd->path, "die")) {
+        for (int i = 0; i < cmd->arg_length; i++) {
+            write(cmd->fd_out, cmd->args[i], strlen(cmd->args[i]));
+            if (i + 1 != cmd->arg_length) write(cmd->fd_out, " ", 1);
+        }
+        write(cmd->fd_out, "\n", 1);
+        return STATUS_DIE;
+    }
+
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+
+
+    if (pid == 0) {
+        if (!isatty(STDIN_FILENO) && cmd->fd_in == STDIN_FILENO) {
+            int dn = open("/dev/null", O_RDONLY);
+            if (dn >= 0) dup2(dn, STDIN_FILENO);
+        }
+
+
+        if (cmd->fd_in != STDIN_FILENO) {
+            dup2(cmd->fd_in, STDIN_FILENO);
+            close(cmd->fd_in);
+        }
+        if (cmd->fd_out != STDOUT_FILENO) {
+            dup2(cmd->fd_out, STDOUT_FILENO);
+            close(cmd->fd_out);
+        }
+
+
+        non_built_in(cmd);
+        exit(1);
+    }
+
+
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+int main(int argc, char **argv) {
+    install_handlers();
+    if (argc == 1)
+        write(1, "\e[1;92mWelcome to my shell!\n", 27);
+
+
+    char c, buf[BUFSIZ];
+    int bytes, pos, command_count = 0;
+    int inR = 0, outR = 0, esc = 0,  comment = 0;
+    int first = 0, cond = 0, last = 0;
+
+
+    if (argc > 1) {
+        int fd = open(argv[1], O_RDONLY);
+        if (fd < 0) { perror("open"); return 1; }
+        dup2(fd, STDIN_FILENO);
+        close(fd);
+    }
+
+
+    while (active) {
+        if (argc == 1) {
+            write(1, "\e[1;95mmysh>\x1b[0m ", 16);
+        }
+
+
+        pos = comment = first = cond = 0;
+        inR = outR = esc = 0;
+
+
+        Command *cmd = newCommand();
+        Command *list[MAX_COMMANDS];
+        list[command_count++] = cmd;
+
+
+        while ((bytes = read(0, &c, 1)) >= 0) {
+
+
+            if (c == '#' && !esc && !comment) {
+                comment = 1;
+                continue;
+            }
+            if (comment && c != '\n' && bytes != 0)
+                continue;
+
+
+            if ((c==' '||c=='\n'||c=='<'||c=='>'||c=='|'||bytes==0) && !esc) {
+
+
+                if (pos == 0 && bytes != 0 && c != '\n') {
+                    if (c=='<') inR=1;
+                    else if (c=='>') outR=1;
+                    else if (c=='|') {
+                        int fd[2]; pipe(fd);
+                        list[command_count-1]->fd_out = fd[1];
+                        cmd = newCommand();
+                        cmd->fd_in = fd[0];
+                        list[command_count++] = cmd;
+                    }
+                    continue;
+                }
+
+
+                buf[pos] = '\0';
+
+
+                if (inR) {
+                    cmd->fd_in = open(buf, O_RDONLY);
+                    if (cmd->fd_in<0) perror("open");
+                    inR=0;
+                }
+                else if (outR) {
+                    cmd->fd_out = open(buf,O_WRONLY|O_CREAT|O_TRUNC,0640);
+                    if (cmd->fd_out<0) perror("open");
+                    outR=0;
+                }
+                else {
+
+
+                    if (!first) {
+                        if (!strcmp(buf,"and")) { cond=1; first=1; goto skip; }
+                        if (!strcmp(buf,"or"))  { cond=2; first=1; goto skip; }
+                        first = 1;
+                    }
+
+
+                    char *arg = strdup(buf);
+                    cmd->args = add_to_args(cmd, cmd->args, &cmd->arg_length, arg);
+                }
+
+
+skip:
+                if (c=='<') inR=1;
+                else if (c=='>') outR=1;
+                else if (c=='|') {
+                    int fd[2]; pipe(fd);
+                    list[command_count-1]->fd_out = fd[1];
+                    cmd = newCommand();
+                    cmd->fd_in = fd[0];
+                    list[command_count++] = cmd;
+                }
+
+
+                if (c=='\n' || bytes==0) {
+
+
+                    int run = 1;
+                    if (cond==1 && last!=0) run=0;
+                    if (cond==2 && last==0) run=0;
+
+
+                    if (run) {
+                        int status = 0;
+                        for (int i=0;i<command_count;i++) {
+                            int r = execute_command(list[i]);
+
+
+                            if (r == STATUS_EXIT) {
+                                freeCommandList(list, command_count);
+                                goto end;
+                            }
+                            if (r == STATUS_DIE) {
+                                freeCommandList(list, command_count);
+                                return 1;
+                            }
+                            if (r != 0) status = 1;
+
+
+                            if (list[i]->fd_in!=STDIN_FILENO) close(list[i]->fd_in);
+                            if (list[i]->fd_out!=STDOUT_FILENO) close(list[i]->fd_out);
+                        }
+                        last = status;
+                    }
+
+
+                    break;
+                }
+
+
+                memset(buf,0,sizeof(buf));
+                pos = 0;
+            }
+            else if (c=='\\' && !esc) {
+                esc = 1;
+
+
+            }
+            else if (c!='\n') {
+                buf[pos++] = c;
+                esc = 0;
+            }
+        }
+
+
+        freeCommandList(list, command_count);
+        command_count = 0;
+    }
+
+
+end:
+    if (argc == 1)
+        write(1, "\e[1;91mmysh: exiting\n", 19);
+
+
+    return 0;
 }
 
-void free_tokens(Token *tokens, int count) {
-    for (int i = 0; i < count; i++) {
-        free(tokens[i].value);
-    }
-    free(tokens);
-}
 
-void free_commands(Command *commands, int count) {
-    for (int i = 0; i < count; i++) {
-        for (int j = 0; j < commands[i].arg_count; j++) {
-            free(commands[i].args[j]);
-        }
-        free(commands[i].args);
-        if (commands[i].input_file) free(commands[i].input_file);
-        if (commands[i].output_file) free(commands[i].output_file);
-    }
-    free(commands);
-}
+
+
+
+
+
+
 
 
