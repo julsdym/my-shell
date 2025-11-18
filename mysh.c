@@ -35,17 +35,18 @@ typedef struct {
 
 int last_exit_status = 0;
 int interactive_mode = 0;
+int should_exit = 0;
 
 // Function prototypes
 void read_command(int fd, char *buffer, int *len);
 int tokenize(char *line, Token **tokens);
 int parse_command(Token *tokens, int token_count, Command **commands, int *is_pipeline, int *is_conditional, char *cond_type);
 int execute_command(Command *commands, int cmd_count, int is_pipeline);
-int execute_builtin(Command *cmd);
+int execute_builtin_in_child(Command *cmd);
+int is_builtin(const char *name);
 char *find_program(const char *name);
 void free_tokens(Token *tokens, int count);
 void free_commands(Command *commands, int count);
-void print_error(const char *msg);
 
 int main(int argc, char *argv[]) {
     int input_fd = STDIN_FILENO;
@@ -110,6 +111,7 @@ int main(int argc, char *argv[]) {
         
         cmd_count = parse_result;
         
+        // Handle conditionals
         if (is_conditional) {
             if (strcmp(cond_type, "and") == 0 && last_exit_status != 0) {
                 free_tokens(tokens, token_count);
@@ -124,24 +126,25 @@ int main(int argc, char *argv[]) {
                 continue;
             }
         }
-    
-        if (cmd_count > 0 && commands[0].arg_count > 0) {
-            if (strcmp(commands[0].args[0], "exit") == 0) {
-                free_tokens(tokens, token_count);
-                free_commands(commands, cmd_count);
-                break;
-            }
-            if (strcmp(commands[0].args[0], "die") == 0) {
-                for (int i = 1; i < commands[0].arg_count; i++) {
-                    printf("%s", commands[0].args[i]);
-                    if (i < commands[0].arg_count - 1) printf(" ");
+        
+        // Check for cd - must be handled specially (not in child process)
+        if (cmd_count == 1 && !is_pipeline && commands[0].arg_count > 0 && 
+            strcmp(commands[0].args[0], "cd") == 0) {
+            if (commands[0].arg_count != 2) {
+                fprintf(stderr, "cd: wrong number of arguments\n");
+                last_exit_status = 1;
+            } else {
+                if (chdir(commands[0].args[1]) < 0) {
+                    perror("cd");
+                    last_exit_status = 1;
+                } else {
+                    last_exit_status = 0;
                 }
-                if (commands[0].arg_count > 1) printf("\n");
-                free_tokens(tokens, token_count);
-                free_commands(commands, cmd_count);
-                if (input_fd != STDIN_FILENO) close(input_fd);
-                return EXIT_FAILURE;
             }
+            free_tokens(tokens, token_count);
+            free_commands(commands, cmd_count);
+            buf_len = 0;
+            continue;
         }
         
         int result = execute_command(commands, cmd_count, is_pipeline);
@@ -150,6 +153,10 @@ int main(int argc, char *argv[]) {
         free_tokens(tokens, token_count);
         free_commands(commands, cmd_count);
         buf_len = 0;
+        
+        if (should_exit) {
+            break;
+        }
     }
     
     if (interactive_mode) {
@@ -254,25 +261,81 @@ int parse_command(Token *tokens, int token_count, Command **commands, int *is_pi
     Command *cmd_array = malloc(sizeof(Command) * MAX_PIPES);
     int cmd_idx = 0;
     int i = 0;
+    
     cmd_array[cmd_idx].args = malloc(sizeof(char*) * MAX_TOKENS);
     cmd_array[cmd_idx].arg_count = 0;
     cmd_array[cmd_idx].input_file = NULL;
     cmd_array[cmd_idx].output_file = NULL;
     
     *is_conditional = 0;
+    *is_pipeline = 0;
+    
+    // Check for conditional at the start
     if (token_count > 0 && (tokens[0].type == TOKEN_AND || tokens[0].type == TOKEN_OR)) {
         *is_conditional = 1;
         strcpy(cond_type, tokens[0].value);
         i = 1;
     }
     
-    *is_pipeline = 0;
+    // Check for pipes to determine if this is a pipeline
+    for (int j = i; j < token_count; j++) {
+        if (tokens[j].type == TOKEN_PIPE) {
+            *is_pipeline = 1;
+            break;
+        }
+    }
+    
+    // Validate: no conditionals after pipes
+    for (int j = i; j < token_count; j++) {
+        if (tokens[j].type == TOKEN_PIPE) {
+            for (int k = j + 1; k < token_count; k++) {
+                if (tokens[k].type == TOKEN_AND || tokens[k].type == TOKEN_OR) {
+                    fprintf(stderr, "Syntax error: conditional after pipe\n");
+                    for (int m = 0; m <= cmd_idx; m++) {
+                        free(cmd_array[m].args);
+                        if (cmd_array[m].input_file) free(cmd_array[m].input_file);
+                        if (cmd_array[m].output_file) free(cmd_array[m].output_file);
+                    }
+                    free(cmd_array);
+                    return -1;
+                }
+            }
+        }
+    }
+    
+    // Validate: no redirection in pipelines (except first and last commands)
+    if (*is_pipeline) {
+        int in_middle = 0;
+        for (int j = i; j < token_count; j++) {
+            if (tokens[j].type == TOKEN_PIPE) {
+                in_middle = 1;
+            } else if (in_middle && (tokens[j].type == TOKEN_INPUT_REDIR || tokens[j].type == TOKEN_OUTPUT_REDIR)) {
+                // Check if we're still in the middle or at the last command
+                int more_pipes = 0;
+                for (int k = j + 1; k < token_count; k++) {
+                    if (tokens[k].type == TOKEN_PIPE) {
+                        more_pipes = 1;
+                        break;
+                    }
+                }
+                if (more_pipes) {
+                    fprintf(stderr, "Syntax error: redirection in middle of pipeline\n");
+                    for (int m = 0; m <= cmd_idx; m++) {
+                        free(cmd_array[m].args);
+                        if (cmd_array[m].input_file) free(cmd_array[m].input_file);
+                        if (cmd_array[m].output_file) free(cmd_array[m].output_file);
+                    }
+                    free(cmd_array);
+                    return -1;
+                }
+            }
+        }
+    }
     
     while (i < token_count) {
         Token *t = &tokens[i];
         
         if (t->type == TOKEN_PIPE) {
-            *is_pipeline = 1;
             cmd_idx++;
             cmd_array[cmd_idx].args = malloc(sizeof(char*) * MAX_TOKENS);
             cmd_array[cmd_idx].arg_count = 0;
@@ -287,6 +350,8 @@ int parse_command(Token *tokens, int token_count, Command **commands, int *is_pi
                 fprintf(stderr, "Syntax error: expected filename after <\n");
                 for (int j = 0; j <= cmd_idx; j++) {
                     free(cmd_array[j].args);
+                    if (cmd_array[j].input_file) free(cmd_array[j].input_file);
+                    if (cmd_array[j].output_file) free(cmd_array[j].output_file);
                 }
                 free(cmd_array);
                 return -1;
@@ -301,6 +366,8 @@ int parse_command(Token *tokens, int token_count, Command **commands, int *is_pi
                 fprintf(stderr, "Syntax error: expected filename after >\n");
                 for (int j = 0; j <= cmd_idx; j++) {
                     free(cmd_array[j].args);
+                    if (cmd_array[j].input_file) free(cmd_array[j].input_file);
+                    if (cmd_array[j].output_file) free(cmd_array[j].output_file);
                 }
                 free(cmd_array);
                 return -1;
@@ -319,6 +386,7 @@ int parse_command(Token *tokens, int token_count, Command **commands, int *is_pi
         
         i++;
     }
+    
     for (int j = 0; j <= cmd_idx; j++) {
         cmd_array[j].args[cmd_array[j].arg_count] = NULL;
     }
@@ -327,51 +395,52 @@ int parse_command(Token *tokens, int token_count, Command **commands, int *is_pi
     return cmd_idx + 1;
 }
 
-int execute_builtin(Command *cmd) {
-    if (strcmp(cmd->args[0], "cd") == 0) {
-        if (cmd->arg_count != 2) {
-            fprintf(stderr, "cd: wrong number of arguments\n");
-            return -1;
-        }
-        if (chdir(cmd->args[1]) < 0) {
-            perror("cd");
-            return -1;
-        }
-        return 0;
-    }
-    
+int is_builtin(const char *name) {
+    return strcmp(name, "cd") == 0 || strcmp(name, "pwd") == 0 ||
+           strcmp(name, "which") == 0 || strcmp(name, "exit") == 0 ||
+           strcmp(name, "die") == 0;
+}
+
+int execute_builtin_in_child(Command *cmd) {
     if (strcmp(cmd->args[0], "pwd") == 0) {
         char cwd[BUFFER_SIZE];
         if (getcwd(cwd, sizeof(cwd)) != NULL) {
             printf("%s\n", cwd);
-            return 0;
+            exit(EXIT_SUCCESS);
         } else {
             perror("pwd");
-            return -1;
+            exit(EXIT_FAILURE);
         }
     }
     
     if (strcmp(cmd->args[0], "which") == 0) {
         if (cmd->arg_count != 2) {
-            return -1;
+            exit(EXIT_FAILURE);
         }
-        if (strcmp(cmd->args[1], "cd") == 0 || strcmp(cmd->args[1], "pwd") == 0 ||
-            strcmp(cmd->args[1], "which") == 0 || strcmp(cmd->args[1], "exit") == 0 ||
-            strcmp(cmd->args[1], "die") == 0) {
-            return -1;
+        if (is_builtin(cmd->args[1])) {
+            exit(EXIT_FAILURE);
         }
         
         char *path = find_program(cmd->args[1]);
         if (path) {
             printf("%s\n", path);
             free(path);
-            return 0;
+            exit(EXIT_SUCCESS);
         }
-        return -1;
+        exit(EXIT_FAILURE);
     }
     
     if (strcmp(cmd->args[0], "exit") == 0) {
-        return 0;
+        exit(EXIT_SUCCESS);
+    }
+    
+    if (strcmp(cmd->args[0], "die") == 0) {
+        for (int i = 1; i < cmd->arg_count; i++) {
+            printf("%s", cmd->args[i]);
+            if (i < cmd->arg_count - 1) printf(" ");
+        }
+        if (cmd->arg_count > 1) printf("\n");
+        exit(EXIT_FAILURE);
     }
     
     return -1;
@@ -384,6 +453,7 @@ char *find_program(const char *name) {
         }
         return NULL;
     }
+    
     const char *dirs[] = {"/usr/local/bin", "/usr/bin", "/bin"};
     for (int i = 0; i < 3; i++) {
         char path[BUFFER_SIZE];
@@ -397,14 +467,7 @@ char *find_program(const char *name) {
 }
 
 int execute_command(Command *commands, int cmd_count, int is_pipeline) {
-    if (cmd_count == 1 && !is_pipeline && commands[0].arg_count > 0) {
-        const char *cmd_name = commands[0].args[0];
-        if (strcmp(cmd_name, "cd") == 0 || strcmp(cmd_name, "pwd") == 0 ||
-            strcmp(cmd_name, "which") == 0 || strcmp(cmd_name, "exit") == 0) {
-            return execute_builtin(&commands[0]);
-        }
-    }
-    
+    // Create pipes before forking
     int pipes[MAX_PIPES][2];
     for (int i = 0; i < cmd_count - 1; i++) {
         if (pipe(pipes[i]) < 0) {
@@ -414,30 +477,50 @@ int execute_command(Command *commands, int cmd_count, int is_pipeline) {
     }
     
     pid_t pids[MAX_PIPES];
-    int redirect_stdin_to_null = !interactive_mode && !isatty(STDIN_FILENO);
+    int should_redirect_stdin = !interactive_mode && !isatty(STDIN_FILENO);
     
     for (int i = 0; i < cmd_count; i++) {
         Command *cmd = &commands[i];
         
         if (cmd->arg_count == 0) continue;
-                char *prog_path = find_program(cmd->args[0]);
-        if (!prog_path) {
-            fprintf(stderr, "%s: command not found\n", cmd->args[0]);
-            for (int j = 0; j < cmd_count - 1; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
+        
+        // Check if command is found
+        char *prog_path = NULL;
+        if (!is_builtin(cmd->args[0])) {
+            prog_path = find_program(cmd->args[0]);
+            if (!prog_path) {
+                fprintf(stderr, "%s: command not found\n", cmd->args[0]);
+                // Close all pipes and wait for already started children
+                for (int j = 0; j < cmd_count - 1; j++) {
+                    close(pipes[j][0]);
+                    close(pipes[j][1]);
+                }
+                for (int j = 0; j < i; j++) {
+                    waitpid(pids[j], NULL, 0);
+                }
+                return -1;
             }
-            return -1;
         }
         
         pid_t pid = fork();
         if (pid < 0) {
             perror("fork");
-            free(prog_path);
+            if (prog_path) free(prog_path);
+            // Close pipes and cleanup
+            for (int j = 0; j < cmd_count - 1; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            for (int j = 0; j < i; j++) {
+                waitpid(pids[j], NULL, 0);
+            }
             return -1;
         }
         
         if (pid == 0) {
+            // Child process
+            
+            // Handle input redirection
             if (cmd->input_file) {
                 int fd = open(cmd->input_file, O_RDONLY);
                 if (fd < 0) {
@@ -448,11 +531,15 @@ int execute_command(Command *commands, int cmd_count, int is_pipeline) {
                 close(fd);
             } else if (i > 0) {
                 dup2(pipes[i-1][0], STDIN_FILENO);
-            } else if (redirect_stdin_to_null) {
+            } else if (should_redirect_stdin) {
                 int null_fd = open("/dev/null", O_RDONLY);
-                dup2(null_fd, STDIN_FILENO);
-                close(null_fd);
+                if (null_fd >= 0) {
+                    dup2(null_fd, STDIN_FILENO);
+                    close(null_fd);
+                }
             }
+            
+            // Handle output redirection
             if (cmd->output_file) {
                 int fd = open(cmd->output_file, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP);
                 if (fd < 0) {
@@ -465,29 +552,55 @@ int execute_command(Command *commands, int cmd_count, int is_pipeline) {
                 dup2(pipes[i][1], STDOUT_FILENO);
             }
             
+            // Close all pipe file descriptors in child
             for (int j = 0; j < cmd_count - 1; j++) {
                 close(pipes[j][0]);
                 close(pipes[j][1]);
             }
             
-            execv(prog_path, cmd->args);
-            perror(prog_path);
-            exit(EXIT_FAILURE);
+            // Execute the command
+            if (is_builtin(cmd->args[0])) {
+                execute_builtin_in_child(cmd);
+                // If we get here, it's a built-in that should set should_exit
+                if (strcmp(cmd->args[0], "exit") == 0) {
+                    exit(EXIT_SUCCESS);
+                } else if (strcmp(cmd->args[0], "die") == 0) {
+                    exit(EXIT_FAILURE);
+                }
+                exit(EXIT_FAILURE);
+            } else {
+                execv(prog_path, cmd->args);
+                perror(prog_path);
+                exit(EXIT_FAILURE);
+            }
         }
         
+        // Parent process
         pids[i] = pid;
-        free(prog_path);
+        if (prog_path) free(prog_path);
     }
     
+    // Close all pipes in parent
     for (int i = 0; i < cmd_count - 1; i++) {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
     
+    // Wait for all children and check for exit/die
     int last_status = 0;
     for (int i = 0; i < cmd_count; i++) {
         int status;
         waitpid(pids[i], &status, 0);
+        
+        // Check if this was exit or die command
+        if (commands[i].arg_count > 0) {
+            if (strcmp(commands[i].args[0], "exit") == 0) {
+                should_exit = 1;
+            } else if (strcmp(commands[i].args[0], "die") == 0) {
+                should_exit = 1;
+            }
+        }
+        
         if (i == cmd_count - 1) {
             last_status = WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
         }
@@ -514,3 +627,5 @@ void free_commands(Command *commands, int count) {
     }
     free(commands);
 }
+
+
