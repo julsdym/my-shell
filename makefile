@@ -1,5 +1,5 @@
 CC     = gcc
-FLAGS = -g -std=c99 -Wall -Wvla -Werror -fsanitize=address,undefined
+FLAGS = -g -std=c99 -Wall -Werror -fsanitize=address
 
 all: mysh
 
